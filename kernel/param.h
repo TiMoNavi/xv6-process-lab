@@ -12,3 +12,11 @@
 #define FSSIZE      2000              // size of file system in blocks
 #define MAXPATH     128               // maximum file path name
 #define USERSTACK   1                 // user stack pages
+
+// Compile-time scheduler policy. The default preserves xv6's existing
+// process-table round-robin behavior. MLFQ is reserved for M3.
+#define SCHED_POLICY_RR   0
+#define SCHED_POLICY_MLFQ 1
+#ifndef SCHED_POLICY
+#define SCHED_POLICY SCHED_POLICY_RR
+#endif
