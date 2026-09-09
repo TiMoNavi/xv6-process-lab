@@ -101,4 +101,13 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // p->lock must be held when using these scheduler counters.
+  uint64 run_ticks;      // Timer ticks observed while RUNNING
+  uint64 wait_ticks;     // Global ticks spent RUNNABLE
+  uint64 sleep_ticks;    // Global ticks spent SLEEPING
+  uint64 dispatches;     // Times selected by scheduler()
+  uint64 preemptions;    // Timer-driven yields
+  uint64 runnable_since; // Global tick snapshot on entry to RUNNABLE
+  uint64 sleep_since;    // Global tick snapshot on entry to SLEEPING
 };

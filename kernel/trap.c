@@ -82,8 +82,10 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  if (which_dev == 2) {
+    proc_account_preemption();
     yield();
+  }
 
   prepare_return();
 
@@ -154,8 +156,10 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  if (which_dev == 2 && myproc() != 0) {
+    proc_account_preemption();
     yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -166,6 +170,15 @@ kerneltrap()
 void
 clockintr()
 {
+  struct proc *p = myproc();
+
+  if (p != 0) {
+    acquire(&p->lock);
+    if (p->state == RUNNING)
+      p->run_ticks++;
+    release(&p->lock);
+  }
+
   if (cpuid() == 0) {
     acquire(&tickslock);
     ticks++;

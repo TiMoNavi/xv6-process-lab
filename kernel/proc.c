@@ -26,6 +26,36 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+// ticks is updated under tickslock by CPU 0. Scheduler bookkeeping takes an
+// atomic snapshot instead of acquiring tickslock while holding p->lock, which
+// avoids a tickslock -> p->lock cycle with clockintr()'s wakeup path.
+static uint64
+proc_ticks(void)
+{
+  return (uint64)__atomic_load_n(&ticks, __ATOMIC_RELAXED);
+}
+
+// The caller must hold p->lock. Every path that makes a process runnable goes
+// through this helper so wait_ticks has one well-defined starting point.
+static void
+proc_set_runnable(struct proc *p)
+{
+  if (p->state == SLEEPING) {
+    p->sleep_ticks += (uint64)(uint)(proc_ticks() - p->sleep_since);
+    p->sleep_since = 0;
+  }
+  p->runnable_since = proc_ticks();
+  p->state = RUNNABLE;
+}
+
+// The caller must hold p->lock.
+static void
+proc_set_sleeping(struct proc *p)
+{
+  p->sleep_since = proc_ticks();
+  p->state = SLEEPING;
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -124,6 +154,13 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->run_ticks = 0;
+  p->wait_ticks = 0;
+  p->sleep_ticks = 0;
+  p->dispatches = 0;
+  p->preemptions = 0;
+  p->runnable_since = 0;
+  p->sleep_since = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -167,6 +204,13 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->run_ticks = 0;
+  p->wait_ticks = 0;
+  p->sleep_ticks = 0;
+  p->dispatches = 0;
+  p->preemptions = 0;
+  p->runnable_since = 0;
+  p->sleep_since = 0;
   p->state = UNUSED;
 }
 
@@ -225,7 +269,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
+  proc_set_runnable(p);
 
   release(&p->lock);
 }
@@ -298,7 +342,7 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
-  np->state = RUNNABLE;
+  proc_set_runnable(np);
   release(&np->lock);
 
   return pid;
@@ -425,6 +469,18 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+static int
+scheduler_candidate(struct proc *p)
+{
+#if SCHED_POLICY == SCHED_POLICY_RR
+  return p->state == RUNNABLE;
+#elif SCHED_POLICY == SCHED_POLICY_MLFQ
+#error "MLFQ is reserved for M3; use SCHED_POLICY_RR until it is implemented"
+#else
+#error "Unknown SCHED_POLICY"
+#endif
+}
+
 void
 scheduler(void)
 {
@@ -444,7 +500,12 @@ scheduler(void)
     int found = 0;
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
+      if (scheduler_candidate(p)) {
+        // The low 32 bits are the source counter. Unsigned subtraction keeps
+        // this correct when the hardware tick counter wraps around.
+        p->wait_ticks += (uint64)(uint)(proc_ticks() - p->runnable_since);
+        p->runnable_since = 0;
+        p->dispatches++;
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
@@ -502,8 +563,20 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
+  proc_set_runnable(p);
   sched();
+  release(&p->lock);
+}
+
+// Record a timer-driven preemption before yield() changes the process state.
+// The caller is in a trap path and does not hold p->lock.
+void
+proc_account_preemption(void)
+{
+  struct proc *p = myproc();
+
+  acquire(&p->lock);
+  p->preemptions++;
   release(&p->lock);
 }
 
@@ -566,7 +639,7 @@ sleep(void)
 
   acquire(&p->lock);
   if (p->chan != 0) {
-    p->state = SLEEPING;
+    proc_set_sleeping(p);
     sched();
   }
   release(&p->lock);
@@ -586,9 +659,9 @@ wakeup(void *chan)
       p->chan = 0;
 
       // If this waiting process has gotten so far as to actually
-      // go to sleep, also set it back to RUNNING.
+      // go to sleep, also set it back to RUNNABLE.
       if (p->state == SLEEPING) {
-        p->state = RUNNABLE;
+        proc_set_runnable(p);
       }
     }
     release(&p->lock);
@@ -609,7 +682,7 @@ kkill(int pid)
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
-        p->state = RUNNABLE;
+        proc_set_runnable(p);
       }
       release(&p->lock);
       return 0;
@@ -695,7 +768,9 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+    printk("%d %s %s run=%lu wait=%lu sleep=%lu dispatch=%lu preempt=%lu",
+           p->pid, state, p->name, p->run_ticks, p->wait_ticks,
+           p->sleep_ticks, p->dispatches, p->preemptions);
     printk("\n");
   }
 }
